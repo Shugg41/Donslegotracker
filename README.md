@@ -14,23 +14,31 @@ Built with [Streamlit](https://streamlit.io). The whole app is one file:
 **Adding a set** — tap **➕ Add a LEGO set**, type the number printed on the box
 (like `10276`) or the set's name (like `Millennium Falcon`), and pick it from
 the list. The name, theme, piece count, year, minifigure count and official
-picture all fill themselves in.
+picture all fill themselves in. Want it but don't own it yet? Tap **⭐ Wishlist**
+instead — and hit **🛒 I bought it!** when you get it.
 
 **Timing a build** — open a set and hit **▶️ Start build session**. The clock
 keeps running even if you close the app or your phone locks — come back later
 and hit **⏹️ Stop & save**. Forgot to stop? A paused session saves itself after
 an hour, and you can always correct the minutes afterwards.
 
+**Finishing** — when the last brick clicks in, hit **🎉 I finished it!** on the
+set's Timer tab. Balloons.
+
 **Photos** — snap progress pictures from the **📸 Photos** tab, or right after a
 session when the app offers. They appear in the set's **📖 Journal** alongside
 your notes, newest first.
 
-**Statuses** — 📦 Unbuilt · 🔧 Building · ✅ Built · ⏸️ On Hold.
+**Finding things** — the search box above your sets matches names, set numbers
+and themes as you type.
+
+**Statuses** — 📦 Unbuilt · 🔧 Building · ✅ Built · ⏸️ On Hold (and ⭐ Wishlist
+for sets you don't own yet).
 
 **Is my stuff safe?** — every change is backed up automatically. If a backup
 ever fails, an orange warning appears at the top with a **Retry backup** button.
-No warning means it's saved. The **📤 Export** page can also mirror everything
-into a Google Sheet, or hand you an Excel/CSV copy.
+No warning means it's saved. The bottom of the **📊 Stats** page can also hand
+you an Excel copy of everything.
 
 ---
 
@@ -61,9 +69,8 @@ GITHUB_REPO  = "username/reponame"
 # Automatic set lookup (recommended — this is what makes adding sets one-tap)
 REBRICKABLE_API_KEY = "..."
 
-# Live mirror into a Google Sheet (optional)
-GSHEET_WEBHOOK_URL = "https://script.google.com/macros/s/XXXX/exec"
-# GSHEET_SECRET    = "the-same-password-as-SECRET-in-the-Apps-Script"
+# Simple PIN lock (recommended — the app URL is public without it)
+APP_PIN = "1234"
 ```
 
 **`GITHUB_TOKEN` / `GITHUB_REPO`** — the app has no server database. It keeps
@@ -85,9 +92,11 @@ count and set picture, all from the number on the box. Without it, the add-set
 form falls back to typing the details in by hand, and everything else in the app
 works exactly the same.
 
-**Google Sheets sync** — optional one-way mirror of the whole collection into a
-sheet you own. Setup instructions are on the app's **📤 Export** page and in
-[`docs/GOOGLE_SHEETS_SYNC.md`](./docs/GOOGLE_SHEETS_SYNC.md).
+**`APP_PIN`** — any string; whoever opens the app must type it once. After a
+correct entry the PIN rides along in the page URL, so bookmarking the unlocked
+page means never typing it again on that device. It's a garden gate, not a bank
+vault — it keeps strangers who stumble on the URL from scribbling on the
+collection, nothing more. Leave it unset for no lock.
 
 ### Deploying to Streamlit Community Cloud
 
@@ -97,7 +106,9 @@ sheet you own. Setup instructions are on the app's **📤 Export** page and in
    minute or two. The [keep-awake workflow](.github/workflows/keep-awake.yml)
    visits the app every 2 hours to prevent that — set a repository variable
    named `APP_URL` to your app's URL (*Settings → Secrets and variables →
-   Actions → Variables*) to switch it on.
+   Actions → Variables*) to switch it on. If you set `APP_PIN`, include it in
+   the variable so the pinger gets past the lock:
+   `https://your-app.streamlit.app/?key=YOURPIN`
 
 ### What's stored where
 
@@ -108,7 +119,8 @@ sheet you own. Setup instructions are on the app's **📤 Export** page and in
 | `brick_bench.py` | The entire app |
 
 Tables: `Sets` (set_num, name, theme, pieces, year, minifigs, image_url, status,
-rating, notes, last_worked), `Build_Logs`, `Photos`, `Active_Timer`, `App_State`.
+rating, notes, last_worked, price_paid), `Build_Logs`, `Photos`, `Active_Timer`,
+`App_State`. Wishlist sets are rows with `status='Wishlist'`.
 
 ---
 
