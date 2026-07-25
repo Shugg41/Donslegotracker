@@ -4,7 +4,6 @@ import pandas as pd
 import requests
 import base64
 import io
-import json
 import os
 from datetime import datetime
 
@@ -263,6 +262,41 @@ def secret(key, default=""):
         return default
 
 # ─────────────────────────────────────────────
+# PIN LOCK (optional — set APP_PIN in the app secrets)
+# ─────────────────────────────────────────────
+# Streamlit apps are public URLs, so with no gate anyone who finds the link
+# can edit the collection. This is deliberately lightweight: one shared PIN,
+# checked before anything else renders. After a correct entry the PIN rides
+# in the URL (?key=...), so bookmarking the unlocked page means never typing
+# it again. It's a garden gate, not a bank vault — fine for this app, where
+# the worst case is someone scribbling on a LEGO list.
+_pin = str(secret("APP_PIN") or "")
+if _pin:
+    if st.query_params.get("key") == _pin:
+        st.session_state['authed'] = True
+    if not st.session_state.get('authed'):
+        _, mid, _ = st.columns([1, 2, 1])
+        with mid:
+            st.markdown(
+                "<div style='text-align:center;margin-top:15vh;font-size:3rem'>🧱</div>"
+                "<div style='text-align:center;color:var(--accent);font-weight:800;"
+                "font-size:1.3rem;margin-bottom:1rem'>The Brick Bench</div>",
+                unsafe_allow_html=True)
+            entered = st.text_input("PIN", type="password", label_visibility="collapsed",
+                                    placeholder="Enter your PIN")
+            if st.button("Unlock", type="primary", use_container_width=True):
+                if entered == _pin:
+                    st.session_state['authed'] = True
+                    st.query_params["key"] = _pin
+                    st.rerun()
+                else:
+                    st.error("That's not it — try again.")
+            st.caption("Tip: after unlocking, bookmark the page and you "
+                       "won't need the PIN on this device again.")
+        st.stop()
+del _pin
+
+# ─────────────────────────────────────────────
 # GITHUB HELPERS
 # ─────────────────────────────────────────────
 def gh_headers():
@@ -356,7 +390,16 @@ c.execute('''CREATE TABLE IF NOT EXISTS Sets
               status      TEXT DEFAULT 'Unbuilt',
               rating      INTEGER DEFAULT 0,
               notes       TEXT,
-              last_worked TEXT)''')
+              last_worked TEXT,
+              price_paid  REAL)''')
+
+# Migration: databases created before price tracking existed lack the column,
+# and the deployed app restores its DB from GitHub — so CREATE TABLE alone
+# never upgrades a live collection.
+_set_cols = [row[1] for row in c.execute("PRAGMA table_info(Sets)").fetchall()]
+if 'price_paid' not in _set_cols:
+    c.execute("ALTER TABLE Sets ADD COLUMN price_paid REAL")
+    conn.commit()
 
 c.execute('''CREATE TABLE IF NOT EXISTS Build_Logs
              (log_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -562,7 +605,7 @@ def rb_search_sets(query, limit=12):
         return [], err
     return [_rb_row_to_set(r, with_extras=False) for r in data.get("results", [])], None
 
-def add_set_to_collection(info):
+def add_set_to_collection(info, wishlist=False):
     """Insert a set. Returns (ok, message). Never overwrites an existing row."""
     set_num = (info.get("set_num") or "").strip()
     if not set_num:
@@ -577,8 +620,9 @@ def add_set_to_collection(info):
         (set_num, info.get("name") or set_num, info.get("theme"),
          safe_int(info.get("pieces")), safe_int(info.get("year")),
          safe_int(info.get("minifigs")), info.get("image_url"),
-         'Unbuilt', str(datetime.now().date())))
-    return True, f"Added {info.get('name') or set_num}!"
+         WISHLIST if wishlist else 'Unbuilt', str(datetime.now().date())))
+    name = info.get('name') or set_num
+    return True, (f"⭐ {name} is on the wishlist!" if wishlist else f"Added {name}!")
 
 def refresh_set_from_rebrickable(set_num):
     """Re-pull catalog details for a set already in the collection. Only
@@ -598,80 +642,6 @@ def refresh_set_from_rebrickable(set_num):
          info.get("image_url"), set_num))
     return True, "Set details refreshed."
 
-# ─────────────────────────────────────────────
-# GOOGLE SHEETS SYNC (optional, via Apps Script webhook)
-# ─────────────────────────────────────────────
-def gsheet_webhook():
-    return secret("GSHEET_WEBHOOK_URL")
-
-def _tab_payload(df):
-    """Serialize a DataFrame to {columns, rows} with JSON-native types
-    (to_json handles NaN -> null and numpy -> native, which raw .tolist() does not)."""
-    obj = json.loads(df.to_json(orient="split"))
-    return {"columns": obj["columns"], "rows": obj["data"]}
-
-def sync_to_sheet():
-    """Push a full snapshot of the collection to the user's Google Sheet via
-    their Apps Script web app. Best-effort — returns (ok, message)."""
-    url = gsheet_webhook()
-    if not url:
-        return False, "No GSHEET_WEBHOOK_URL configured."
-    try:
-        sets_df = pd.read_sql_query("SELECT * FROM Sets ORDER BY set_num", conn)
-        logs    = pd.read_sql_query("SELECT * FROM Build_Logs ORDER BY set_num, start_time", conn)
-        photos  = pd.read_sql_query("SELECT * FROM Photos ORDER BY set_num, uploaded_at", conn)
-        payload = {
-            "secret": secret("GSHEET_SECRET"),
-            "tabs": {
-                "Sets":       _tab_payload(sets_df),
-                "Build Logs": _tab_payload(logs),
-                "Photos":     _tab_payload(photos),
-            },
-        }
-        # Apps Script 302-redirects to googleusercontent; requests follows it.
-        r = requests.post(url, json=payload, timeout=15)
-        try:
-            ok_flag = (r.json().get("status") == "ok")
-        except Exception:
-            ok_flag = r.ok
-        return (True, "Synced.") if ok_flag else (False, f"HTTP {r.status_code}: {r.text[:150]}")
-    except Exception as e:
-        return False, str(e)
-
-# Paste-able Apps Script for the user's Google Sheet (shown on the Export page).
-APPS_SCRIPT_CODE = '''const SECRET = "";  // optional: set a password, then put the same value in GSHEET_SECRET
-
-function doPost(e) {
-  try {
-    const body = JSON.parse(e.postData.contents);
-    if (SECRET && body.secret !== SECRET) {
-      return ContentService
-        .createTextOutput(JSON.stringify({status: "error", message: "bad secret"}))
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const tabs = body.tabs || {};
-    Object.keys(tabs).forEach(function (name) {
-      let sheet = ss.getSheetByName(name);
-      if (!sheet) sheet = ss.insertSheet(name);
-      sheet.clearContents();
-      const cols = tabs[name].columns || [];
-      const rows = tabs[name].rows || [];
-      const data = [cols].concat(rows);
-      if (cols.length) {
-        sheet.getRange(1, 1, data.length, cols.length).setValues(data);
-      }
-    });
-    return ContentService
-      .createTextOutput(JSON.stringify({status: "ok"}))
-      .setMimeType(ContentService.MimeType.JSON);
-  } catch (err) {
-    return ContentService
-      .createTextOutput(JSON.stringify({status: "error", message: String(err)}))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-}'''
-
 def save_and_report(success_msg="Saved!"):
     """Save and surface the real outcome to the user. On failure we never
     claim success — the change is local-only and at risk until it syncs."""
@@ -681,11 +651,6 @@ def save_and_report(success_msg="Saved!"):
         st.session_state['unsynced'] = False
         if success_msg:
             st.success(success_msg)
-        # Best-effort live mirror to the user's Google Sheet, only if a webhook
-        # is configured. Never blocks or fails the save — just a toast either way.
-        if gsheet_webhook():
-            sok, smsg = sync_to_sheet()
-            st.toast("📊 Google Sheet updated" if sok else f"⚠️ Sheet sync failed: {smsg}")
     else:
         st.session_state['unsynced'] = True
         st.error(
@@ -697,10 +662,16 @@ def save_and_report(success_msg="Saved!"):
 # ─────────────────────────────────────────────
 # QUERY HELPERS
 # ─────────────────────────────────────────────
+# 'Wishlist' also lives in the status column, but it's a different idea —
+# a set Don wants, not one he owns — so it never appears in this dropdown,
+# and owned-set lists/stats filter it out.
+WISHLIST       = 'Wishlist'
 STATUS_OPTIONS = ['Unbuilt', 'Building', 'Built', 'On Hold']
-STATUS_EMOJI   = {'Unbuilt': '📦', 'Building': '🔧', 'Built': '✅', 'On Hold': '⏸️'}
+STATUS_EMOJI   = {'Unbuilt': '📦', 'Building': '🔧', 'Built': '✅', 'On Hold': '⏸️',
+                  WISHLIST: '⭐'}
 STATUS_COLOR   = {'Unbuilt': '#777f8f', 'Building': 'var(--building)',
-                  'Built': 'var(--built)', 'On Hold': '#8b90a0'}
+                  'Built': 'var(--built)', 'On Hold': '#8b90a0',
+                  WISHLIST: 'var(--accent)'}
 
 def get_all_sets():
     return pd.read_sql_query("SELECT * FROM Sets ORDER BY last_worked DESC NULLS LAST", conn)
@@ -865,14 +836,14 @@ elif _set_exists(get_app_state('last_opened_set')):
 
 with st.container(key="nowrap_topnav"):
     if build_target:
-        nb, n1, n2, n3 = st.columns(4)
+        nb, n1, n2 = st.columns(3)
         with nb:
             if st.button("⏱ Build", use_container_width=True, type="primary"):
                 st.session_state.page = 'workbench'
                 st.session_state.selected_set = build_target
                 st.rerun()
     else:
-        n1, n2, n3 = st.columns(3)
+        n1, n2 = st.columns(2)
     with n1:
         if st.button("🧱 Sets", use_container_width=True):
             st.session_state.page = 'collection'
@@ -881,11 +852,6 @@ with st.container(key="nowrap_topnav"):
     with n2:
         if st.button("📊 Stats", use_container_width=True):
             st.session_state.page = 'stats'
-            st.session_state.selected_set = None
-            st.rerun()
-    with n3:
-        if st.button("📤 Export", use_container_width=True):
-            st.session_state.page = 'export'
             st.session_state.selected_set = None
             st.rerun()
 
@@ -1010,23 +976,28 @@ if st.session_state.page == 'collection':
                             f"<div class='search-hit-meta'>{meta}</div>",
                             unsafe_allow_html=True)
                     with hc3:
-                        already = c.execute("SELECT 1 FROM Sets WHERE set_num=?",
+                        already = c.execute("SELECT status FROM Sets WHERE set_num=?",
                                             (hit.get("set_num"),)).fetchone()
                         if already:
-                            st.caption("✓ In collection")
-                        elif st.button("➕ Add", key=f"add_{hit.get('set_num')}",
-                                       use_container_width=True):
-                            # Search hits skip the extra theme/minifig calls;
-                            # fetch the full record now that it's actually wanted.
-                            full, _ferr = rb_lookup_set(hit["set_num"])
-                            ok, msg = add_set_to_collection(full or hit)
-                            if ok:
-                                if save_and_report(msg):
-                                    st.session_state.pop('search_results', None)
-                                    st.session_state.pop('search_error', None)
-                                    st.rerun()
-                            else:
-                                st.warning(msg)
+                            st.caption("⭐ On wishlist" if already[0] == WISHLIST
+                                       else "✓ In collection")
+                        else:
+                            add_it  = st.button("➕ Add", key=f"add_{hit.get('set_num')}",
+                                                use_container_width=True)
+                            wish_it = st.button("⭐ Wishlist", key=f"wish_{hit.get('set_num')}",
+                                                use_container_width=True)
+                            if add_it or wish_it:
+                                # Search hits skip the extra theme/minifig calls;
+                                # fetch the full record now that it's actually wanted.
+                                full, _ferr = rb_lookup_set(hit["set_num"])
+                                ok, msg = add_set_to_collection(full or hit, wishlist=wish_it)
+                                if ok:
+                                    if save_and_report(msg):
+                                        st.session_state.pop('search_results', None)
+                                        st.session_state.pop('search_error', None)
+                                        st.rerun()
+                                else:
+                                    st.warning(msg)
             st.divider()
             manual_label = "✏️ Or type the details in by hand"
         else:
@@ -1046,7 +1017,10 @@ if st.session_state.page == 'collection':
                 m_pieces = mc1.number_input("Pieces",   min_value=0, step=1, value=0)
                 m_year   = mc2.number_input("Year",     min_value=0, max_value=2100, step=1, value=0)
                 m_figs   = mc3.number_input("Minifigs", min_value=0, step=1, value=0)
-                if st.form_submit_button("Add to collection"):
+                fb1, fb2 = st.columns(2)
+                submit_own  = fb1.form_submit_button("Add to collection")
+                submit_wish = fb2.form_submit_button("⭐ Add to wishlist")
+                if submit_own or submit_wish:
                     if not m_num:
                         st.error("Please enter a set number.")
                     elif not m_name:
@@ -1060,22 +1034,37 @@ if st.session_state.page == 'collection':
                             "year":      m_year or None,
                             "minifigs":  m_figs or None,
                             "image_url": None,
-                        })
+                        }, wishlist=submit_wish)
                         if ok:
                             if save_and_report(msg):
                                 st.rerun()
                         else:
                             st.warning(msg)
 
+    all_sets  = get_all_sets()
+    owned_df  = all_sets[all_sets['status'] != WISHLIST] if not all_sets.empty else all_sets
+    wish_df   = all_sets[all_sets['status'] == WISHLIST] if not all_sets.empty else all_sets
+
+    # Search — always visible; the single most useful control once the
+    # collection outgrows one screen.
+    search_q = st.text_input("Search", label_visibility="collapsed",
+                             placeholder="🔍 Search your sets…").strip().lower()
+
     # Filters — collapsed by default to keep the phone view short
-    all_sets = get_all_sets()
-    with st.expander("🔍 Filter & sort"):
+    with st.expander("🎛️ Filter & sort"):
         status_filter = st.selectbox("Filter by status", ['All'] + STATUS_OPTIONS)
-        themes = ['All'] + sorted(all_sets['theme'].dropna().unique().tolist()) if not all_sets.empty else ['All']
+        themes = ['All'] + sorted(owned_df['theme'].dropna().unique().tolist()) if not owned_df.empty else ['All']
         theme_filter = st.selectbox("Filter by theme", themes)
         sort_by = st.selectbox("Sort by", ['Last Worked', 'Name', 'Pieces', 'Theme', 'Year', 'Status'])
 
-    display_df = all_sets.copy()
+    def _search_mask(df):
+        return (df['name'].str.lower().str.contains(search_q, na=False)
+                | df['set_num'].str.lower().str.contains(search_q, na=False)
+                | df['theme'].str.lower().str.contains(search_q, na=False))
+
+    display_df = owned_df.copy()
+    if search_q and not display_df.empty:
+        display_df = display_df[_search_mask(display_df)]
     if status_filter != 'All':
         display_df = display_df[display_df['status'] == status_filter]
     if theme_filter != 'All':
@@ -1090,8 +1079,11 @@ if st.session_state.page == 'collection':
     if all_sets.empty:
         st.info("👋 **Welcome!** Your collection is empty. Open **➕ Add a LEGO set** "
                 "above, type the number off the box, and you're away.")
+    elif display_df.empty and owned_df.empty:
+        st.info("Nothing owned yet — but the wishlist below is a good start! "
+                "Tap **🛒 I bought it!** on a set when you get it.")
     elif display_df.empty:
-        st.info("No sets match those filters.")
+        st.info("No sets match that search." if search_q else "No sets match those filters.")
     else:
         # Set cards — single-column compact list (phone-first)
         for _, row in display_df.iterrows():
@@ -1123,16 +1115,52 @@ if st.session_state.page == 'collection':
                 st.session_state.page = 'workbench'
                 st.rerun()
 
+    # ── Wishlist — sets Don wants but doesn't own yet ──
+    if not wish_df.empty:
+        shown_wish = wish_df[_search_mask(wish_df)] if search_q else wish_df
+        st.divider()
+        st.markdown("<h2>⭐ Wishlist</h2>", unsafe_allow_html=True)
+        if shown_wish.empty:
+            st.caption("No wishlist sets match that search.")
+        for _, row in shown_wish.iterrows():
+            st.markdown(
+                "<div class='set-card'>"
+                f"{thumb_html(row['image_url'])}"
+                "<div class='set-card-body'>"
+                f"<div class='set-card-title'>⭐ {row['name']}</div>"
+                f"<div class='set-card-meta'>{set_meta_line(row)}</div>"
+                "</div></div>",
+                unsafe_allow_html=True)
+            with st.container(key=f"nowrap_wish_{row['set_num']}"):
+                wc1, wc2 = st.columns([3, 1])
+                with wc1:
+                    if st.button("🛒 I bought it!", key=f"buy_{row['set_num']}",
+                                 use_container_width=True, type="primary"):
+                        c.execute("UPDATE Sets SET status='Unbuilt', last_worked=? WHERE set_num=?",
+                                  (str(datetime.now().date()), row['set_num']))
+                        if save_and_report(f"🎉 {row['name']} is yours — moved to your collection!"):
+                            st.rerun()
+                with wc2:
+                    if st.button("🗑️", key=f"unwish_{row['set_num']}",
+                                 help="Remove from wishlist", use_container_width=True):
+                        c.execute("DELETE FROM Sets WHERE set_num=?", (row['set_num'],))
+                        if save_and_report(None):
+                            st.rerun()
+
     # ── Plain-language help, tucked at the bottom ──
     with st.expander("❓ How this works"):
         st.markdown("""
 **Adding a set** — tap **➕ Add a LEGO set**, type the number printed on the box
 (or the set's name), and pick it from the list. Everything else fills itself in.
+Want it but don't own it yet? Tap **⭐ Wishlist** instead.
 
 **Timing a build** — open a set and hit **▶️ Start build session**. The clock
 keeps running even if you close the app or your phone locks, so come back later
 and hit **⏹️ Stop & save**. Forgot to stop? A paused session saves itself after
 an hour, and you can always correct the minutes afterwards.
+
+**Finishing** — when the last brick clicks in, hit **🎉 I finished it!** on the
+set's Timer tab.
 
 **Photos** — snap progress pictures from the **📸 Photos** tab, or right after a
 session when it offers. They show up in the set's **📖 Journal** next to your notes.
@@ -1149,9 +1177,13 @@ elif st.session_state.page == 'stats':
     st.markdown("<h2>📊 Collection Stats</h2>", unsafe_allow_html=True)
 
     all_sets = get_all_sets()
+    # Wishlist sets aren't owned — they get one chip of their own below and
+    # stay out of every other number on this page.
+    own_sets = all_sets[all_sets['status'] != WISHLIST] if not all_sets.empty else all_sets
+    n_wish   = len(all_sets) - len(own_sets)
     all_logs = pd.read_sql_query("SELECT * FROM Build_Logs", conn)
 
-    if all_sets.empty:
+    if own_sets.empty:
         st.info("Add some sets to see your stats!")
     else:
         # ── Top row stats ──
@@ -1162,29 +1194,31 @@ elif st.session_state.page == 'stats':
         else:
             real_logs = all_logs
 
-        total_pieces     = int(all_sets['pieces'].fillna(0).sum())
-        built_sets       = all_sets[all_sets['status'] == 'Built']
+        total_pieces     = int(own_sets['pieces'].fillna(0).sum())
+        built_sets       = own_sets[own_sets['status'] == 'Built']
         pieces_built     = int(built_sets['pieces'].fillna(0).sum())
-        total_minifigs   = int(all_sets['minifigs'].fillna(0).sum())
+        total_minifigs   = int(own_sets['minifigs'].fillna(0).sum())
+        total_spent      = float(own_sets['price_paid'].fillna(0).sum()) if 'price_paid' in own_sets.columns else 0
         total_build_secs = all_logs['duration'].sum() if not all_logs.empty else 0
         avg_session_mins = round((real_logs['duration'].mean() or 0) / 60, 1) if not real_logs.empty else 0
         total_sessions   = len(real_logs)
         est_count        = len(all_logs) - len(real_logs)
         total_photos     = pd.read_sql_query("SELECT COUNT(*) as n FROM Photos", conn)['n'].iloc[0] or 0
-        n_building       = len(all_sets[all_sets['status'] == 'Building'])
+        n_building       = len(own_sets[own_sets['status'] == 'Building'])
 
         # Pieces per hour, over finished sets only — the number is meaningless
-        # while a build is still half-done.
+        # while a build is still half-done, and absurd until a real amount of
+        # time is logged (one 3-second session would claim millions/hour).
         built_secs = (all_logs[all_logs['set_num'].isin(built_sets['set_num'])]['duration'].sum()
                       if not all_logs.empty else 0)
-        pph = int(pieces_built / (built_secs / 3600)) if built_secs > 0 and pieces_built else 0
+        pph = int(pieces_built / (built_secs / 3600)) if built_secs >= 3600 and pieces_built else 0
 
         # Compact wrapping stat chips (3-up on phones) instead of stacked tiles
         chips = [
             (f"{round(total_build_secs/3600, 1)}h", "Hours Building"),
             (total_sessions,                        "Sessions"),
             (f"{avg_session_mins}m",                "Avg Session"),
-            (len(all_sets),                         "Sets Owned"),
+            (len(own_sets),                         "Sets Owned"),
             (n_building,                            "On the Bench"),
             (len(built_sets),                       "Built"),
             (f"{total_pieces:,}",                   "Pieces Owned"),
@@ -1193,6 +1227,10 @@ elif st.session_state.page == 'stats':
         ]
         if pph:
             chips.append((f"{pph:,}", "Pieces / Hour"))
+        if total_spent:
+            chips.append((f"${total_spent:,.0f}", "Total Spent"))
+        if n_wish:
+            chips.append((n_wish, "Wishlist"))
         chips.append((total_photos, "Photos"))
 
         chips_html = "".join(
@@ -1211,14 +1249,14 @@ elif st.session_state.page == 'stats':
 
         with col_left:
             st.markdown("#### 🎨 By Theme")
-            themed = all_sets.dropna(subset=['theme'])
+            themed = own_sets.dropna(subset=['theme'])
             if themed.empty:
                 st.caption("No themes recorded yet.")
             else:
                 theme_counts = themed.groupby('theme').size().reset_index(name='count')
                 theme_counts = theme_counts.sort_values('count', ascending=False).head(10)
                 for _, r in theme_counts.iterrows():
-                    pct = int(r['count'] / len(all_sets) * 100)
+                    pct = int(r['count'] / len(own_sets) * 100)
                     st.markdown(f"""
                     <div style='margin-bottom:8px'>
                         <div style='display:flex;justify-content:space-between;margin-bottom:3px'>
@@ -1232,9 +1270,9 @@ elif st.session_state.page == 'stats':
 
         with col_right:
             st.markdown("#### 📈 By Status")
-            status_counts = all_sets.groupby('status').size().reset_index(name='count')
+            status_counts = own_sets.groupby('status').size().reset_index(name='count')
             for _, r in status_counts.iterrows():
-                pct   = int(r['count'] / len(all_sets) * 100)
+                pct   = int(r['count'] / len(own_sets) * 100)
                 color = STATUS_COLOR.get(r['status'], 'var(--accent)')
                 st.markdown(f"""
                 <div style='margin-bottom:8px'>
@@ -1315,80 +1353,26 @@ elif st.session_state.page == 'stats':
                     <span style='color:var(--accent);font-weight:700'>{fmt_seconds(r['duration'])}</span>
                 </div>""", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# EXPORT PAGE — get a copy of your data that's yours
-# ─────────────────────────────────────────────
-elif st.session_state.page == 'export':
-    st.markdown("<h2>📤 Export Your Data</h2>", unsafe_allow_html=True)
-    st.markdown("Your collection, always in sync with your Google Sheet.")
-
-    sets_df   = get_all_sets()
-    logs_df   = pd.read_sql_query("SELECT * FROM Build_Logs ORDER BY set_num, start_time", conn)
-    photos_df = pd.read_sql_query("SELECT * FROM Photos ORDER BY set_num, uploaded_at", conn)
-
-    # ── Google Sheet sync — primary ─────────────────────────────
-    st.markdown("<h3>🔄 Google Sheet sync</h3>", unsafe_allow_html=True)
-    if gsheet_webhook():
-        st.success("✅ Connected — your sheet auto-updates on every save.")
-        st.caption(f"{len(sets_df)} sets · {len(logs_df)} sessions · {len(photos_df)} photos")
-        if st.button("🔄 Sync now", type="primary"):
-            with st.spinner("Pushing to your Google Sheet..."):
-                ok, msg = sync_to_sheet()
-            if ok:
-                st.success("Google Sheet updated!")
-            else:
-                st.error(f"Sync failed: {msg}")
-    else:
-        st.info("Not connected yet. Set it up once below, then it stays in sync automatically.")
-        with st.expander("⚙️ One-time setup (about 5 minutes)"):
-            st.markdown("""
-**1.** Create (or open) a Google Sheet you want your data mirrored into.
-
-**2.** In that sheet: **Extensions → Apps Script**. Delete whatever's there and paste the script below. *(Optional: set `SECRET` to any password to lock down your webhook.)*
-
-**3.** Click **Deploy → New deployment** → gear icon → **Web app**. Set **Execute as: Me** and **Who has access: Anyone**, then **Deploy**. Approve the access prompt (click *Advanced → Go to … (unsafe)* — it's your own script).
-
-**4.** Copy the **Web app URL** it gives you.
-
-**5.** Add it to your app secrets (`.streamlit/secrets.toml`, or *Manage app → Secrets* on Streamlit Cloud):
-```toml
-GSHEET_WEBHOOK_URL = "https://script.google.com/macros/s/XXXX/exec"
-# GSHEET_SECRET = "the-same-password-as-SECRET"   # only if you set one
-```
-
-**6.** Reload this app and hit **Sync now**. Every save after that updates the sheet automatically.
-""")
-            st.caption("Paste this into Apps Script:")
-            st.code(APPS_SCRIPT_CODE, language="javascript")
-
-    # ── Download backup (collapsed) ─────────────────────────────
-    st.divider()
-    with st.expander("⬇️ Download a backup copy"):
-        if sets_df.empty and logs_df.empty:
-            st.info("Nothing to export yet.")
-        else:
-            stamp = datetime.now().strftime("%Y-%m-%d")
+    # ── Take-it-with-you copy, tucked at the very bottom ──
+    if not all_sets.empty:
+        st.divider()
+        with st.expander("⬇️ Download a copy of everything"):
+            st.caption("One Excel file with your sets, build sessions and photo list. "
+                       "Your data is already backed up automatically — this is just "
+                       "a copy that's yours to keep.")
+            logs_df   = pd.read_sql_query("SELECT * FROM Build_Logs ORDER BY set_num, start_time", conn)
+            photos_df = pd.read_sql_query("SELECT * FROM Photos ORDER BY set_num, uploaded_at", conn)
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-                sets_df.to_excel(xl,   sheet_name="Sets",       index=False)
+                all_sets.to_excel(xl,  sheet_name="Sets",       index=False)
                 logs_df.to_excel(xl,   sheet_name="Build Logs", index=False)
                 photos_df.to_excel(xl, sheet_name="Photos",     index=False)
             st.download_button(
-                "⬇️ Excel workbook (.xlsx) — Sets, Build Logs, Photos",
+                "⬇️ Download (Excel)",
                 data=buf.getvalue(),
-                file_name=f"brick_bench_export_{stamp}.xlsx",
+                file_name=f"brick_bench_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True)
-            d1, d2, d3 = st.columns(3)
-            with d1:
-                st.download_button("Sets.csv", sets_df.to_csv(index=False),
-                    f"sets_{stamp}.csv", "text/csv", use_container_width=True)
-            with d2:
-                st.download_button("Build Logs.csv", logs_df.to_csv(index=False),
-                    f"build_logs_{stamp}.csv", "text/csv", use_container_width=True)
-            with d3:
-                st.download_button("Photos.csv", photos_df.to_csv(index=False),
-                    f"photos_{stamp}.csv", "text/csv", use_container_width=True)
 
 # ─────────────────────────────────────────────
 # WORKBENCH PAGE
@@ -1418,6 +1402,20 @@ elif st.session_state.page == 'workbench':
 
     st.markdown(f"<div class='stats-line'>{set_meta_line(lego_set)}</div>", unsafe_allow_html=True)
 
+    # A wishlist set isn't owned yet — no timer, journal or photos to show.
+    # (Normally unreachable: wishlist cards have no Open button. This covers
+    # the set being wished-for while it's also the remembered last-opened.)
+    if lego_set['status'] == WISHLIST:
+        if lego_set['image_url']:
+            st.image(lego_set['image_url'], width=220)
+        st.info("⭐ This set is on the wishlist — grab it and the workbench opens up!")
+        if st.button("🛒 I bought it!", type="primary", use_container_width=True):
+            c.execute("UPDATE Sets SET status='Unbuilt', last_worked=? WHERE set_num=?",
+                      (str(datetime.now().date()), set_num))
+            if save_and_report(f"🎉 {lego_set['name']} is yours!"):
+                st.rerun()
+        st.stop()
+
     tab_timer, tab_journal, tab_details, tab_photos = st.tabs(
         ["⏱️ Timer", "📖 Journal", "📋 Details", "📸 Photos"])
 
@@ -1428,6 +1426,16 @@ elif st.session_state.page == 'workbench':
         # Check for active timer
         active = get_active_timer()
         is_active = active and active[0] == set_num
+
+        # The just-finished celebration — balloons fire on the rerun after
+        # the finish button, or they'd be wiped by the rerun itself.
+        if st.session_state.pop('finished', None) == set_num:
+            st.balloons()
+            n_sess = len(get_logs(set_num))
+            built_line = (f"Built in {fmt_seconds(secs_logged)} across "
+                          f"{n_sess} session{'s' if n_sess != 1 else ''}."
+                          if n_sess else "Another one for the shelf.")
+            st.success(f"🎉 **{lego_set['name']} — BUILT!** {built_line}")
 
         # Post-session recap: the session is already saved (nothing can be
         # lost) — this just offers a note + photo while it's fresh.
@@ -1559,6 +1567,23 @@ elif st.session_state.page == 'workbench':
             else:
                 if st.button("▶️ Start build session", type="primary", use_container_width=True):
                     set_active_timer(set_num, datetime.now().isoformat())
+                    st.rerun()
+
+        # ── The big moment: finishing a build ──
+        if lego_set['status'] != 'Built':
+            if st.button("🎉 I finished it!", use_container_width=True):
+                if is_active:
+                    # Bank the running session before celebrating, so the
+                    # final stretch of build time isn't lost.
+                    c.execute(
+                        "INSERT INTO Build_Logs (set_num, start_time, duration, notes) VALUES (?,?,?,?)",
+                        (set_num, active[1], timer_elapsed_seconds(active), ""))
+                    c.execute("DELETE FROM Active_Timer")
+                c.execute("UPDATE Sets SET status='Built', last_worked=? WHERE set_num=?",
+                          (str(datetime.now().date()), set_num))
+                if save_and_report(None):
+                    st.session_state['finished'] = set_num
+                    st.session_state.pop('recap', None)
                     st.rerun()
 
         st.divider()
@@ -1699,11 +1724,13 @@ elif st.session_state.page == 'workbench':
                 index=STATUS_OPTIONS.index(lego_set['status']) if lego_set['status'] in STATUS_OPTIONS else 0)
             new_rating = st.slider("My rating (1–10)", 1, 10,
                 int(lego_set['rating']) if lego_set['rating'] else 1)
+            new_price  = st.number_input("What I paid (optional, $)", min_value=0.0,
+                step=1.0, value=safe_float(lego_set['price_paid']) or 0.0)
             new_notes  = st.text_area("Notes / tips",
                 value=str(lego_set['notes']) if lego_set['notes'] else "")
             if st.form_submit_button("💾 Save changes"):
-                c.execute("UPDATE Sets SET status=?, rating=?, notes=? WHERE set_num=?",
-                          (new_status, new_rating, new_notes, set_num))
+                c.execute("UPDATE Sets SET status=?, rating=?, price_paid=?, notes=? WHERE set_num=?",
+                          (new_status, new_rating, new_price or None, new_notes, set_num))
                 if save_and_report("Saved!"):
                     st.rerun()
 
@@ -1790,3 +1817,10 @@ elif st.session_state.page == 'workbench':
                         c.execute("DELETE FROM Photos WHERE photo_id=?", (photo['photo_id'],))
                         if save_and_report(None):
                             st.rerun()
+
+# Unknown page value (e.g. a session from an older version of the app) —
+# land on the collection rather than a blank screen.
+else:
+    st.session_state.page = 'collection'
+    st.session_state.selected_set = None
+    st.rerun()
