@@ -1,7 +1,7 @@
 # Live Google Sheets sync
 
 Mirror your collection into a Google Sheet you own. On every save, the app
-pushes a full snapshot to your sheet — **Models**, **Build Logs**, and
+pushes a full snapshot to your sheet — **Sets**, **Build Logs**, and
 **Photos** each land on their own tab.
 
 This uses a Google Apps Script "web app" as the receiver, so there is **no
